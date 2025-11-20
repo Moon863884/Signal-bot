@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
 signal_bot.py
-- Giám sát BTCUSDT (Binance)
+- Giám sát BTCUSDT và XAUUSDT trên Binance
 - EMA100/EMA200 + Engulfing trên nến vừa đóng
-- Điều kiện: Giá trên/dưới EMA200 → hồi về EMA100/EMA200 → nến engulfing → gửi Telegram
+- Giá trên/dưới EMA200 → hồi về EMA100/EMA200 → gửi Telegram
 """
 
 import time
@@ -11,15 +11,14 @@ import requests
 import traceback
 import pandas as pd
 
-# === CẤU HÌNH ===
 TELEGRAM_TOKEN = "8230123317:AAEmQgEU2BVZy9xV1LvURMlN3bvmcZOzM4k"
 TELEGRAM_CHAT_ID = "6146169999"
 
-SYMBOL = "BTCUSDT"
+SYMBOLS = ["BTCUSDT", "XAUUSDT"]
 TIMEFRAMES = ["5m", "15m", "1h"]
 EMA_PERIODS = [100, 200]
-POLL_INTERVAL = 60  # giây
-PRICE_TOUCH_THRESHOLD_PCT = 0.0015  # ±0.15%
+POLL_INTERVAL = 60
+PRICE_TOUCH_THRESHOLD_PCT = 0.0015
 BINANCE_REST = "https://api.binance.com/api/v3/klines"
 
 # === HỖ TRỢ HÀM ===
@@ -54,4 +53,82 @@ def is_engulfing(prev_open, prev_close, curr_open, curr_close):
     if prev_close > prev_open and curr_close < curr_open and curr_body > tiny:
         if curr_open >= prev_close - 1e-12 and curr_close <= prev_open + 1e-12:
             return True,"bearish"
-    retu
+    return False,""
+
+def near_ema(price, ema_value, pct_threshold=PRICE_TOUCH_THRESHOLD_PCT):
+    if ema_value == 0: return False
+    return abs(price - ema_value)/ema_value <= pct_threshold
+
+def send_telegram(text):
+    payload = {"chat_id": TELEGRAM_CHAT_ID,"text":text,"parse_mode":"HTML"}
+    try:
+        r = requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json=payload, timeout=10)
+        return r.status_code == 200
+    except Exception as e:
+        print("Telegram send error:", e)
+        return False
+
+# === LOGIC CHÍNH ===
+
+def analyze_symbol_timeframe(symbol, timeframe):
+    try:
+        kl = fetch_klines(symbol, timeframe)
+        df = klines_to_df(kl)
+        if len(df)<4: return None
+        df["ema100"] = compute_ema(df["close"],100)
+        df["ema200"] = compute_ema(df["close"],200)
+        closed = df.iloc[-2]
+        prev = df.iloc[-3]
+        results=[]
+        for ema_period in EMA_PERIODS:
+            ema_val = closed[f"ema{ema_period}"]
+            is_eng,direction = is_engulfing(prev["open"],prev["close"],closed["open"],closed["close"])
+            if not is_eng: continue
+            touched = near_ema(closed["close"], closed["ema100"]) or near_ema(closed["close"], closed["ema200"])
+            trend_ok = closed["close"] > closed["ema200"] or closed["close"] < closed["ema200"]
+            if touched and trend_ok:
+                msg = (
+                    f"📡 <b>SIGNAL</b>\nMarket: <b>{symbol}</b>\nTF: <b>{timeframe}</b>\n"
+                    f"EMA: <b>{ema_period}</b>\nType: <b>{direction.upper()} engulfing</b>\n"
+                    f"Price: {closed['close']:.8f}\nCandle Open/Close: {closed['open']:.8f}/{closed['close']:.8f}\n"
+                    f"EMA{ema_period}: {ema_val:.8f}\nTime: {closed['open_time']}\nNote: Engulfing + hồi về EMA100/200."
+                )
+                results.append({"symbol":symbol,"tf":timeframe,"ema":ema_period,"dir":direction,"msg":msg})
+        return results
+    except Exception as e:
+        print(f"Error analyze {symbol} {timeframe}: {e}")
+        traceback.print_exc()
+        return None
+
+def main_loop():
+    print("Starting signal bot (BTC + XAUUSDT)...")
+    last_sent = {}
+    cooldown = 60*10
+    while True:
+        try:
+            for symbol in SYMBOLS:
+                for tf in TIMEFRAMES:
+                    res = analyze_symbol_timeframe(symbol, tf)
+                    if res:
+                        for r in res:
+                            key=(r["symbol"],r["tf"],r["ema"],r["dir"])
+                            now=time.time()
+                            prev_ts=last_sent.get(key,0)
+                            if now-prev_ts<cooldown: continue
+                            ok = send_telegram(r["msg"])
+                            if ok:
+                                print(f"Sent signal {key} at {time.strftime('%Y-%m-%d %H:%M:%S')}")
+                                last_sent[key]=now
+                            else:
+                                print("Failed to send telegram for",key)
+            time.sleep(POLL_INTERVAL)
+        except KeyboardInterrupt:
+            print("Stopping by user")
+            break
+        except Exception as e:
+            print("Main loop error:", e)
+            traceback.print_exc()
+            time.sleep(10)
+
+if __name__=="__main__":
+    main_loop()
