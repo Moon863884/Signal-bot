@@ -31,21 +31,42 @@ PRICE_TOUCH_THRESHOLD_PCT = 0.0015       # ngưỡng chạm EMA nếu không ch�
 
 # === HỖ TRỢ HÀM ===
 
-def fetch_klines(symbol: str, interval: str, limit: int = 500) -> List:
-    params = {"symbol": symbol, "interval": interval, "limit": limit}
-    r = requests.get(BINANCE_REST, params=params, timeout=10)
-    r.raise_for_status()
-    return r.json()
+import yfinance as yf
 
-def klines_to_df(klines: List) -> pd.DataFrame:
-    # Binance kline format, lấy open time, open, high, low, close, volume
-    cols = ["open_time","open","high","low","close","volume","close_time",
-            "qav","num_trades","taker_base","taker_quote","ignore"]
-    df = pd.DataFrame(klines, columns=cols)
-    for c in ["open","high","low","close","volume"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
-    return df[["open_time","open","high","low","close","volume"]]
+def fetch_klines(symbol: str, interval: str, limit: int = 500) -> list:
+    """
+    Lấy dữ liệu nến.
+    - BTCUSDT -> Binance
+    - XAUUSD -> yfinance (TradingView / Yahoo)
+    """
+    if symbol == "BTCUSDT":
+        params = {"symbol": symbol, "interval": interval, "limit": limit}
+        r = requests.get(BINANCE_REST, params=params, timeout=10)
+        r.raise_for_status()
+        return r.json()
+    elif symbol in ["XAUUSD","XAUUSDT"]:  # vàng
+        # yfinance mapping: 'XAUUSD=X'
+        yf_symbol = "XAUUSD=X"
+        # mapping interval
+        interval_map = {
+            "1m":"1m", "5m":"5m", "15m":"15m", "30m":"30m",
+            "1h":"60m", "2h":"120m", "4h":"240m", "1d":"1d"
+        }
+        yf_interval = interval_map.get(interval, "1h")
+        data = yf.download(yf_symbol, period="5d", interval=yf_interval)
+        # convert to Binance-like list of lists
+        klines = []
+        for idx, row in data.iterrows():
+            ts = int(idx.timestamp() * 1000)
+            o = row["Open"]
+            h = row["High"]
+            l = row["Low"]
+            c = row["Close"]
+            v = row["Volume"]
+            klines.append([ts,o,h,l,c,v,ts,0,0,0,0,0])
+        return klines
+    else:
+        raise ValueError(f"No source defined for symbol {symbol}")
 
 def compute_ema(series: pd.Series, period: int) -> pd.Series:
     # pandas ewm (exponential weighted mean) — tương đương EMA
@@ -190,3 +211,4 @@ def main_loop():
 
 if __name__ == "__main__":
     main_loop()
+
