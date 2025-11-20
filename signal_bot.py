@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 signal_bot.py
-- Giám sát BTCUSDT (Binance) và XAU/USD (OANDA)
+- Giám sát BTCUSDT (Binance) và XAU/USD (Alpha Vantage)
 - EMA100/EMA200 + Engulfing trên nến vừa đóng
 - Gửi cảnh báo qua Telegram
 """
@@ -10,8 +10,6 @@ import time
 import requests
 import traceback
 import pandas as pd
-from oandapyV20 import API
-import oandapyV20.endpoints.instruments as instruments
 
 # === CẤU HÌNH ===
 TELEGRAM_TOKEN = "8230123317:AAEmQgEU2BVZy9xV1LvURMlN3bvmcZOzM4k"
@@ -20,46 +18,48 @@ TELEGRAM_CHAT_ID = "6146169999"
 SYMBOLS = ["BTCUSDT", "XAUUSD"]
 TIMEFRAMES = ["5m", "15m", "1h"]
 EMA_PERIODS = [100, 200]
-POLL_INTERVAL = 30
+POLL_INTERVAL = 60
 PRICE_TOUCH_THRESHOLD_PCT = 0.0015
 BINANCE_REST = "https://api.binance.com/api/v3/klines"
-TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+ALPHA_KEY = "4Z2TFS34K5D26HBR"
 
-# === OANDA CONFIG ===
-OANDA_ACCESS_TOKEN = "YOUR_OANDA_API_TOKEN"
-OANDA_ACCOUNT_ID = "YOUR_ACCOUNT_ID"
-api_oanda = API(access_token=OANDA_ACCESS_TOKEN)
-
-# Mapping timeframe -> OANDA granularity
-OANDA_INTERVAL_MAP = {"5m":"M5","15m":"M15","1h":"H1"}
+# Mapping timeframe -> Alpha Vantage interval
+AV_INTERVAL_MAP = {"5m":"5min","15m":"15min","1h":"60min"}
 
 # === HỖ TRỢ HÀM ===
-def fetch_klines(symbol: str, interval: str, limit: int = 500):
+def fetch_klines(symbol, interval, limit=500):
     if symbol == "BTCUSDT":
         params = {"symbol": symbol, "interval": interval, "limit": limit}
         r = requests.get(BINANCE_REST, params=params, timeout=10)
         r.raise_for_status()
         return r.json()
     elif symbol == "XAUUSD":
-        gran = OANDA_INTERVAL_MAP.get(interval, "H1")
-        params = {"granularity": gran, "count": limit}
-        r = instruments.InstrumentsCandles(instrument="XAU_USD", params=params)
-        data = api_oanda.request(r)
+        av_interval = AV_INTERVAL_MAP.get(interval,"15min")
+        url = f"https://www.alphavantage.co/query?function=FX_INTRADAY&from_symbol=XAU&to_symbol=USD&interval={av_interval}&apikey={ALPHA_KEY}&outputsize=full"
+        r = requests.get(url, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        ts_key = f"Time Series FX ({av_interval})"
+        if ts_key not in data:
+            raise ValueError("Alpha Vantage no data, check API key or limit")
         candles = []
-        for c in data['candles']:
-            if c['complete']:
-                ts = pd.to_datetime(c['time'])
-                candles.append([ts, float(c['mid']['o']), float(c['mid']['h']),
-                                float(c['mid']['l']), float(c['mid']['c']), 0])
+        count = 0
+        for time_str, val in sorted(data[ts_key].items()):
+            candles.append([pd.to_datetime(time_str), float(val['1. open']),
+                            float(val['2. high']), float(val['3. low']),
+                            float(val['4. close']), 0])
+            count += 1
+            if count >= limit:
+                break
         return candles
     else:
         raise ValueError(f"No source for symbol {symbol}")
 
 def klines_to_df(klines):
     if not klines: return pd.DataFrame()
-    if isinstance(klines[0][0], pd.Timestamp):  # OANDA
+    if isinstance(klines[0][0], pd.Timestamp):
         df = pd.DataFrame(klines, columns=["open_time","open","high","low","close","volume"])
-    else:  # Binance
+    else:
         cols = ["open_time","open","high","low","close","volume","close_time",
                 "qav","num_trades","taker_base","taker_quote","ignore"]
         df = pd.DataFrame(klines, columns=cols)
@@ -73,26 +73,26 @@ def compute_ema(series, period):
     return series.ewm(span=period, adjust=False).mean()
 
 def is_engulfing(prev_open, prev_close, curr_open, curr_close):
-    def body_size(o,c): return abs(c - o)
+    def body_size(o,c): return abs(c-o)
     prev_body = body_size(prev_open, prev_close)
     curr_body = body_size(curr_open, curr_close)
     tiny = 1e-8
     if prev_close < prev_open and curr_close > curr_open and curr_body > tiny:
         if curr_open <= prev_close + 1e-12 and curr_close >= prev_open - 1e-12:
-            return True, "bullish"
+            return True,"bullish"
     if prev_close > prev_open and curr_close < curr_open and curr_body > tiny:
         if curr_open >= prev_close - 1e-12 and curr_close <= prev_open + 1e-12:
-            return True, "bearish"
-    return False, ""
+            return True,"bearish"
+    return False,""
 
 def near_ema(price, ema_value, pct_threshold=PRICE_TOUCH_THRESHOLD_PCT):
     if ema_value == 0: return False
     return abs(price - ema_value)/ema_value <= pct_threshold
 
 def send_telegram(text):
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode":"HTML"}
+    payload = {"chat_id": TELEGRAM_CHAT_ID,"text":text,"parse_mode":"HTML"}
     try:
-        r = requests.post(TELEGRAM_API, json=payload, timeout=10)
+        r = requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json=payload, timeout=10)
         return r.status_code == 200
     except Exception as e:
         print("Telegram send error:", e)
@@ -103,17 +103,17 @@ def analyze_symbol_timeframe(symbol, timeframe):
     try:
         kl = fetch_klines(symbol, timeframe)
         df = klines_to_df(kl)
-        if len(df) < 4: return None
-        df["ema100"] = compute_ema(df["close"], 100)
-        df["ema200"] = compute_ema(df["close"], 200)
+        if len(df)<4: return None
+        df["ema100"] = compute_ema(df["close"],100)
+        df["ema200"] = compute_ema(df["close"],200)
         closed = df.iloc[-2]  # nến vừa đóng
         prev = df.iloc[-3]
-        results = []
+        results=[]
         for ema_period in EMA_PERIODS:
             ema_val = closed[f"ema{ema_period}"]
-            is_eng, direction = is_engulfing(prev["open"], prev["close"], closed["open"], closed["close"])
+            is_eng,direction = is_engulfing(prev["open"],prev["close"],closed["open"],closed["close"])
             if not is_eng: continue
-            touched = closed["low"] <= ema_val <= closed["high"] or near_ema(closed["close"], ema_val)
+            touched = closed["low"] <= ema_val <= closed["high"] or near_ema(closed["close"],ema_val)
             if touched:
                 msg = (
                     f"📡 <b>SIGNAL</b>\nMarket: <b>{symbol}</b>\nTF: <b>{timeframe}</b>\n"
@@ -139,16 +139,16 @@ def main_loop():
                     res = analyze_symbol_timeframe(symbol, tf)
                     if res:
                         for r in res:
-                            key = (r["symbol"], r["tf"], r["ema"], r["dir"])
-                            now = time.time()
-                            prev_ts = last_sent.get(key,0)
-                            if now - prev_ts < cooldown: continue
+                            key=(r["symbol"],r["tf"],r["ema"],r["dir"])
+                            now=time.time()
+                            prev_ts=last_sent.get(key,0)
+                            if now-prev_ts<cooldown: continue
                             ok = send_telegram(r["msg"])
                             if ok:
                                 print(f"Sent signal {key} at {time.strftime('%Y-%m-%d %H:%M:%S')}")
                                 last_sent[key]=now
                             else:
-                                print("Failed to send telegram for", key)
+                                print("Failed to send telegram for",key)
             time.sleep(POLL_INTERVAL)
         except KeyboardInterrupt:
             print("Stopping by user")
@@ -158,5 +158,5 @@ def main_loop():
             traceback.print_exc()
             time.sleep(10)
 
-if __name__ == "__main__":
+if __name__=="__main__":
     main_loop()
