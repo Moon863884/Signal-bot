@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """
 signal_bot.py
-- Giám sát BTCUSDT (Binance) và XAUUSD (Yahoo Finance)
-- Kiểm tra EMA100/EMA200 và nến Engulfing trên nến vừa đóng
-- Gửi cảnh báo qua Telegram khi thỏa điều kiện
+- Giám sát BTCUSDT (Binance) và XAU/USD (OANDA)
+- EMA100/EMA200 + Engulfing trên nến vừa đóng
+- Gửi cảnh báo qua Telegram
 """
 
 import time
 import requests
 import traceback
-from typing import List
 import pandas as pd
-import yfinance as yf
+from oandapyV20 import API
+import oandapyV20.endpoints.instruments as instruments
 
 # === CẤU HÌNH ===
 TELEGRAM_TOKEN = "8230123317:AAEmQgEU2BVZy9xV1LvURMlN3bvmcZOzM4k"
@@ -21,56 +21,58 @@ SYMBOLS = ["BTCUSDT", "XAUUSD"]
 TIMEFRAMES = ["5m", "15m", "1h"]
 EMA_PERIODS = [100, 200]
 POLL_INTERVAL = 30
-KLINE_LIMIT = 500
 PRICE_TOUCH_THRESHOLD_PCT = 0.0015
-
 BINANCE_REST = "https://api.binance.com/api/v3/klines"
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
 
+# === OANDA CONFIG ===
+OANDA_ACCESS_TOKEN = "YOUR_OANDA_API_TOKEN"
+OANDA_ACCOUNT_ID = "YOUR_ACCOUNT_ID"
+api_oanda = API(access_token=OANDA_ACCESS_TOKEN)
+
+# Mapping timeframe -> OANDA granularity
+OANDA_INTERVAL_MAP = {"5m":"M5","15m":"M15","1h":"H1"}
+
 # === HỖ TRỢ HÀM ===
-def fetch_klines(symbol: str, interval: str, limit: int = 500) -> List:
+def fetch_klines(symbol: str, interval: str, limit: int = 500):
     if symbol == "BTCUSDT":
         params = {"symbol": symbol, "interval": interval, "limit": limit}
         r = requests.get(BINANCE_REST, params=params, timeout=10)
         r.raise_for_status()
         return r.json()
     elif symbol == "XAUUSD":
-        yf_symbol = "XAUUSD=X"
-        # mapping interval -> Yahoo interval + period
-        interval_map = {
-            "1m": ("1m", "7d"),
-            "5m": ("5m", "7d"),
-            "15m": ("15m", "7d"),
-            "30m": ("30m", "60d"),
-            "1h": ("60m", "60d"),
-            "4h": ("240m", "180d"),
-            "1d": ("1d", "1y"),
-        }
-        yf_interval, yf_period = interval_map.get(interval, ("60m", "60d"))
-        data = yf.download(yf_symbol, period=yf_period, interval=yf_interval)
-        if data.empty:
-            raise ValueError(f"No data from Yahoo Finance for {symbol} interval={interval}")
-        klines = []
-        for idx, row in data.iterrows():
-            ts = int(idx.timestamp() * 1000)
-            klines.append([ts, row["Open"], row["High"], row["Low"], row["Close"], row["Volume"], ts,0,0,0,0,0])
-        return klines
+        gran = OANDA_INTERVAL_MAP.get(interval, "H1")
+        params = {"granularity": gran, "count": limit}
+        r = instruments.InstrumentsCandles(instrument="XAU_USD", params=params)
+        data = api_oanda.request(r)
+        candles = []
+        for c in data['candles']:
+            if c['complete']:
+                ts = pd.to_datetime(c['time'])
+                candles.append([ts, float(c['mid']['o']), float(c['mid']['h']),
+                                float(c['mid']['l']), float(c['mid']['c']), 0])
+        return candles
     else:
         raise ValueError(f"No source for symbol {symbol}")
 
-def klines_to_df(klines: List) -> pd.DataFrame:
-    cols = ["open_time","open","high","low","close","volume","close_time",
-            "qav","num_trades","taker_base","taker_quote","ignore"]
-    df = pd.DataFrame(klines, columns=cols)
-    for c in ["open","high","low","close","volume"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
-    return df[["open_time","open","high","low","close","volume"]]
+def klines_to_df(klines):
+    if not klines: return pd.DataFrame()
+    if isinstance(klines[0][0], pd.Timestamp):  # OANDA
+        df = pd.DataFrame(klines, columns=["open_time","open","high","low","close","volume"])
+    else:  # Binance
+        cols = ["open_time","open","high","low","close","volume","close_time",
+                "qav","num_trades","taker_base","taker_quote","ignore"]
+        df = pd.DataFrame(klines, columns=cols)
+        for c in ["open","high","low","close","volume"]:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+        df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
+        df = df[["open_time","open","high","low","close","volume"]]
+    return df
 
-def compute_ema(series: pd.Series, period: int) -> pd.Series:
+def compute_ema(series, period):
     return series.ewm(span=period, adjust=False).mean()
 
-def is_engulfing(prev_open, prev_close, curr_open, curr_close) -> (bool,str):
+def is_engulfing(prev_open, prev_close, curr_open, curr_close):
     def body_size(o,c): return abs(c - o)
     prev_body = body_size(prev_open, prev_close)
     curr_body = body_size(curr_open, curr_close)
@@ -83,12 +85,12 @@ def is_engulfing(prev_open, prev_close, curr_open, curr_close) -> (bool,str):
             return True, "bearish"
     return False, ""
 
-def near_ema(price, ema_value, pct_threshold=PRICE_TOUCH_THRESHOLD_PCT) -> bool:
+def near_ema(price, ema_value, pct_threshold=PRICE_TOUCH_THRESHOLD_PCT):
     if ema_value == 0: return False
-    return abs(price - ema_value) / ema_value <= pct_threshold
+    return abs(price - ema_value)/ema_value <= pct_threshold
 
-def send_telegram(text: str):
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"}
+def send_telegram(text):
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode":"HTML"}
     try:
         r = requests.post(TELEGRAM_API, json=payload, timeout=10)
         return r.status_code == 200
@@ -97,19 +99,16 @@ def send_telegram(text: str):
         return False
 
 # === LOGIC CHÍNH ===
-def analyze_symbol_timeframe(symbol: str, timeframe: str):
+def analyze_symbol_timeframe(symbol, timeframe):
     try:
-        kl = fetch_klines(symbol, timeframe, KLINE_LIMIT)
+        kl = fetch_klines(symbol, timeframe)
         df = klines_to_df(kl)
+        if len(df) < 4: return None
         df["ema100"] = compute_ema(df["close"], 100)
         df["ema200"] = compute_ema(df["close"], 200)
-        if len(df) < 4:  # cần ít nhất 4 nến
-            return None
-
         closed = df.iloc[-2]  # nến vừa đóng
-        prev = df.iloc[-3]    # nến trước nến vừa đóng
+        prev = df.iloc[-3]
         results = []
-
         for ema_period in EMA_PERIODS:
             ema_val = closed[f"ema{ema_period}"]
             is_eng, direction = is_engulfing(prev["open"], prev["close"], closed["open"], closed["close"])
@@ -117,18 +116,12 @@ def analyze_symbol_timeframe(symbol: str, timeframe: str):
             touched = closed["low"] <= ema_val <= closed["high"] or near_ema(closed["close"], ema_val)
             if touched:
                 msg = (
-                    f"📡 <b>SIGNAL</b>\n"
-                    f"Market: <b>{symbol}</b>\n"
-                    f"TF: <b>{timeframe}</b>\n"
-                    f"EMA: <b>{ema_period}</b>\n"
-                    f"Type: <b>{direction.upper()} engulfing</b>\n"
-                    f"Price: {closed['close']:.8f}\n"
-                    f"Candle Open/Close: {closed['open']:.8f} / {closed['close']:.8f}\n"
-                    f"EMA{ema_period}: {ema_val:.8f}\n"
-                    f"Time: {closed['open_time']}\n"
-                    f"Note: Engulfing và chạm EMA (nến vừa đóng)."
+                    f"📡 <b>SIGNAL</b>\nMarket: <b>{symbol}</b>\nTF: <b>{timeframe}</b>\n"
+                    f"EMA: <b>{ema_period}</b>\nType: <b>{direction.upper()} engulfing</b>\n"
+                    f"Price: {closed['close']:.8f}\nCandle Open/Close: {closed['open']:.8f}/{closed['close']:.8f}\n"
+                    f"EMA{ema_period}: {ema_val:.8f}\nTime: {closed['open_time']}\nNote: Engulfing và chạm EMA (nến vừa đóng)."
                 )
-                results.append({"symbol": symbol, "tf": timeframe, "ema": ema_period, "dir": direction, "msg": msg})
+                results.append({"symbol":symbol,"tf":timeframe,"ema":ema_period,"dir":direction,"msg":msg})
         return results
     except Exception as e:
         print(f"Error analyze {symbol} {timeframe}: {e}")
@@ -138,7 +131,7 @@ def analyze_symbol_timeframe(symbol: str, timeframe: str):
 def main_loop():
     print("Starting signal bot...")
     last_sent = {}
-    cooldown = 60 * 10  # 10 phút
+    cooldown = 60*10
     while True:
         try:
             for symbol in SYMBOLS:
@@ -148,12 +141,12 @@ def main_loop():
                         for r in res:
                             key = (r["symbol"], r["tf"], r["ema"], r["dir"])
                             now = time.time()
-                            prev_ts = last_sent.get(key, 0)
+                            prev_ts = last_sent.get(key,0)
                             if now - prev_ts < cooldown: continue
                             ok = send_telegram(r["msg"])
                             if ok:
                                 print(f"Sent signal {key} at {time.strftime('%Y-%m-%d %H:%M:%S')}")
-                                last_sent[key] = now
+                                last_sent[key]=now
                             else:
                                 print("Failed to send telegram for", key)
             time.sleep(POLL_INTERVAL)
