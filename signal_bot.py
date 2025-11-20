@@ -4,8 +4,6 @@ signal_bot.py
 - Giám sát BTCUSDT (Binance) và XAUUSD (Yahoo Finance)
 - Kiểm tra EMA100/EMA200 và nến Engulfing trên nến vừa đóng
 - Gửi cảnh báo qua Telegram khi thỏa điều kiện
-
-Chạy: python3 signal_bot.py
 """
 
 import time
@@ -38,9 +36,20 @@ def fetch_klines(symbol: str, interval: str, limit: int = 500) -> List:
         return r.json()
     elif symbol == "XAUUSD":
         yf_symbol = "XAUUSD=X"
-        interval_map = {"1m":"1m","5m":"5m","15m":"15m","30m":"30m","1h":"60m","4h":"240m","1d":"1d"}
-        yf_interval = interval_map.get(interval, "60m")
-        data = yf.download(yf_symbol, period="5d", interval=yf_interval)
+        # mapping interval -> Yahoo interval + period
+        interval_map = {
+            "1m": ("1m", "7d"),
+            "5m": ("5m", "7d"),
+            "15m": ("15m", "7d"),
+            "30m": ("30m", "60d"),
+            "1h": ("60m", "60d"),
+            "4h": ("240m", "180d"),
+            "1d": ("1d", "1y"),
+        }
+        yf_interval, yf_period = interval_map.get(interval, ("60m", "60d"))
+        data = yf.download(yf_symbol, period=yf_period, interval=yf_interval)
+        if data.empty:
+            raise ValueError(f"No data from Yahoo Finance for {symbol} interval={interval}")
         klines = []
         for idx, row in data.iterrows():
             ts = int(idx.timestamp() * 1000)
@@ -94,7 +103,7 @@ def analyze_symbol_timeframe(symbol: str, timeframe: str):
         df = klines_to_df(kl)
         df["ema100"] = compute_ema(df["close"], 100)
         df["ema200"] = compute_ema(df["close"], 200)
-        if len(df) < 4:  # cần ít nhất 4 nến để lấy nến vừa đóng + trước đó
+        if len(df) < 4:  # cần ít nhất 4 nến
             return None
 
         closed = df.iloc[-2]  # nến vừa đóng
